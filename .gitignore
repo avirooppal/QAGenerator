@@ -30,7 +30,6 @@ ENV/
 
 # Data and Outputs
 data/
-outputs/
 test.csv
 
 # User specific task files
