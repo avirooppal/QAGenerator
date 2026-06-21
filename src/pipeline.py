@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--year", type=int, help="Fiscal year to download (e.g. 2023)")
     parser.add_argument("--query", type=str, help="Search query to retrieve relevant chunks")
     parser.add_argument("--llm", type=str, choices=["gemini", "openrouter"], default="openrouter", help="LLM backend to use (gemini or openrouter)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent workers. Set to 1 for Free Tier APIs, 5+ for Paid Tier.")
     
     args = parser.parse_args()
     
@@ -133,36 +134,86 @@ def main():
         verified_candidates = []
         target_qa_count = 100
         
+        checkpoint_file = parsed_dir / f"{ticker}_{year}_checkpoint.jsonl"
+        if checkpoint_file.exists():
+            logger.info("Found existing checkpoint. Loading saved QA pairs...")
+            with open(checkpoint_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        verified_candidates.append(json.loads(line))
+            logger.info(f"Loaded {len(verified_candidates)} previously verified QA pairs.")
+            
+        # Figure out where to resume chunk processing (roughly) based on checkpoint size
+        # We assume ~1.5 QA pairs generated per chunk. This is an approximation so we don't
+        # re-process the first 50 chunks if we already have 60 QA pairs.
+        start_chunk_idx = min(int(len(verified_candidates) / 1.5), len(chunks_metadata) - 1)
+        if start_chunk_idx > 0:
+            logger.info(f"Resuming generation from chunk index {start_chunk_idx}...")
+        else:
+            start_chunk_idx = 0
+
         logger.info(f"Starting QA Generation. Target: {target_qa_count} pairs.")
         
-        for i, chunk in enumerate(chunks_metadata):
-            if len(verified_candidates) >= target_qa_count:
-                logger.info(f"Successfully generated {target_qa_count} verified QA pairs. Stopping generation.")
-                break
-                
-            try:
-                res_str = generator.generate(chunk)
-                qa_arr = json.loads(res_str)
-                
-                if not isinstance(qa_arr, list):
-                    qa_arr = [qa_arr]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
+        write_lock = threading.Lock()
+        
+        def process_chunk(chunk):
+            max_retries = 3
+            base_delay = 5
+            
+            for attempt in range(max_retries):
+                try:
+                    res_str = generator.generate(chunk)
+                    qa_arr = json.loads(res_str)
+                    if not isinstance(qa_arr, list):
+                        qa_arr = [qa_arr]
                     
-                for qa_obj in qa_arr:
-                    # Verify the generated QA pair
-                    if orchestrator.verify(qa_obj):
-                        verified_candidates.append(qa_obj)
-                        logger.info(f"Accepted QA pair {len(verified_candidates)}/{target_qa_count}")
-                    else:
-                        logger.info("QA pair rejected by verifier.")
+                    accepted = []
+                    for qa_obj in qa_arr:
+                        if orchestrator.verify(qa_obj):
+                            accepted.append(qa_obj)
+                        else:
+                            logger.info("QA pair rejected by verifier.")
+                    return accepted
                     
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if "429" in error_str or "quota" in error_str or "rate limit" in error_str or "402" in error_str:
+                        if attempt < max_retries - 1:
+                            sleep_time = base_delay * (2 ** attempt)
+                            logger.warning(f"Rate limit or Quota hit. Retrying in {sleep_time}s...")
+                            time.sleep(sleep_time)
+                            continue
+                    
+                    logger.error(f"Failed to generate/verify QA: {e}")
+                    return []
+            return []
+
+        # Open checkpoint in append mode
+        with open(checkpoint_file, "a", encoding="utf-8") as chk_f:
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {executor.submit(process_chunk, chunks_metadata[i]): i for i in range(start_chunk_idx, len(chunks_metadata))}
+                
+                for future in as_completed(futures):
                     if len(verified_candidates) >= target_qa_count:
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
                         break
                         
-            except Exception as e:
-                logger.error(f"Failed to generate/verify QA for chunk {i}: {e}")
-                
-            # Rate limiting delay
-            time.sleep(2)
+                    accepted_pairs = future.result()
+                    
+                    with write_lock:
+                        for qa_obj in accepted_pairs:
+                            if len(verified_candidates) >= target_qa_count:
+                                break
+                                
+                            verified_candidates.append(qa_obj)
+                            chk_f.write(json.dumps(qa_obj) + "\n")
+                            chk_f.flush() # Ensure it's written to disk immediately
+                            logger.info(f"Accepted QA pair {len(verified_candidates)}/{target_qa_count}")
             
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         

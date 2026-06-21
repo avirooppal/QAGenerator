@@ -14,7 +14,8 @@ The pipeline consists of the following automated stages:
 ## Design Choices
 - **Dual LLM Support**: The pipeline supports both OpenRouter and Google Gemini APIs via a flexible `--llm` CLI flag, allowing you to seamlessly swap out the generation and verification models.
 - **Strict Entailment Verification**: To ensure a pristine benchmark dataset, local verification rules were replaced with an LLM-based entailment check. The LLM acts as an impartial judge, aggressively filtering out any ungrounded answers.
-- **Array-based Generation**: To comfortably reach the target of 100+ QA pairs, the generation prompt was optimized to extract multiple QA pairs per text chunk.
+- **Semantic Deduplication**: Instead of basic string matching, the pipeline uses `scikit-learn`'s `TfidfVectorizer` to calculate cosine similarity, ensuring that semantically identical questions are dropped and the final dataset is genuinely diverse.
+- **Concurrent Execution & Resiliency**: The pipeline utilizes `ThreadPoolExecutor` to process chunks concurrently, significantly reducing execution time. It also features automatic JSONL checkpointing and an exponential backoff loop, making it completely resilient to API rate limits (HTTP 429) and quota exhaustion.
 
 ## Known Limitations
 - **API Rate Limits & Costs**: Generating and verifying 100+ QA pairs requires making over 200 API calls. Depending on the LLM provider (like Gemini Free Tier), strict rate limits or payment quotas can interrupt the pipeline before the target is reached.
@@ -34,11 +35,13 @@ To scale this pipeline to handle thousands of documents or generate 1000+ pairs:
 Set your API key in the terminal and run the pipeline:
 
 ```bash
-# Using OpenRouter (default)
+# Using OpenRouter (Paid Tier / High Rate Limits)
 $env:OPENROUTER_API_KEY="your_key"
-python -m src.pipeline --ticker AAPL --year 2023 --llm openrouter
+python -m src.pipeline --ticker AAPL --year 2023 --llm openrouter --workers 5
 
-# Using Gemini
+# Using Gemini (Free Tier)
 $env:GEMINI_API_KEY="your_key"
-python -m src.pipeline --ticker AAPL --year 2023 --llm gemini
+python -m src.pipeline --ticker AAPL --year 2023 --llm gemini --workers 1
 ```
+
+*Note: Use `--workers 1` if you are on a free API tier to avoid aggressive rate limiting. For paid tiers, increase `--workers` to 5+ to process chunks concurrently.*
