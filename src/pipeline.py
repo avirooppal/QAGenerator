@@ -10,7 +10,6 @@ from src.parsing.chunker import SentenceSplitter, ChunkBuilder
 from src.utils.hashing import generate_chunk_id
 from src.evidence.extractor import MockEvidenceExtractor
 from src.retrieval.indexer import BM25Indexer
-from src.generation.generator import MockQAGenerator
 
 def main():
     parser = argparse.ArgumentParser(description="10-K Benchmark QA Generator Pipeline")
